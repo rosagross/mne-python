@@ -10,6 +10,7 @@ __all__ = [
     "apply_lcmv_raw",
     "make_dics",
     "make_lcmv",
+    "make_nulling_beamformer",
     "make_lcmv_resolution_matrix",
     "rap_music",
     "read_beamformer",
@@ -30,5 +31,8 @@ from ._lcmv import (
     apply_lcmv_raw,
     make_lcmv,
 )
+
+from ._nulling import make_nulling_beamformer
+
 from ._rap_music import rap_music, trap_music
 from .resolution_matrix import make_lcmv_resolution_matrix
