@@ -23,6 +23,7 @@ from ._compute_beamformer import (
     Beamformer,
     _check_src_type,
     _compute_beamformer,
+    _compute_nulling_beamformer,
     _compute_power,
     _prepare_beamformer_input,
     _proj_whiten_data,
@@ -33,17 +34,14 @@ def make_nulling_beamformer(
     info,
     forward,
     data_cov,
-    null_sources,  # NEW: sources to null
-    null_orientations=None,  # NEW: orientations to null
-    reg=0.05,
+    null_label,
+    target_source,
     noise_cov=None,
     pick_ori=None,
+    inversion="single", # TODO: this is only for now! 
     rank="info",
-    weight_norm="unit-noise-gain-invariant",
-    reduce_rank=False,
+    label=None,
     depth=None,
-    inversion="matrix",
-    verbose=None,
 ):
     """Compute nulling beamformer spatial filter.
     
@@ -52,23 +50,13 @@ def make_nulling_beamformer(
     
     Parameters
     ----------
-    null_sources : array, shape (n_null, 3) or SourceSpaces
-        Source locations to suppress. Can be vertex indices or 
-        coordinates in head space.
-    null_orientations : array, shape (n_null, 3) | None
-        Orientations of sources to null. If None, uses surface normals
-        from forward model.
-    ... (other parameters same as make_lcmv)
-    
+    null_label : Label
+                Label of source locations to be nulled.
+
     Returns
     -------
-    filters : instance of Beamformer
-        Dictionary containing filter weights from nulling beamformer.
-        Additional keys compared to LCMV:
-            'null_sources' : array
-                Source locations that were nulled.
-            'null_orientations' : array
-                Orientations that were nulled.
+    
+
     
     Notes
     -----
@@ -88,26 +76,95 @@ def make_nulling_beamformer(
     ----------
     .. footbibliography::
     """
-    # Reuse LCMV preprocessing
-    # ... (similar setup code)
-    
-    # Compute nulling constraints
-    null_leadfield = _compute_null_leadfield(
-        forward, null_sources, null_orientations
+
+    # check number of sensor types present in the data and ensure a noise cov
+    info = _simplify_info(info, keep=("proc_history",))
+    noise_cov, _, allow_mismatch = _check_one_ch_type(
+        "lcmv", info, forward, data_cov, noise_cov
     )
     
-    # Compute nulling beamformer weights
-    W = _compute_nulling_weights(
-        G, Cm, null_leadfield, reg, weight_norm, ...
+    # XXX we need this extra picking step (can't just rely on minimum norm's
+    # because there can be a mismatch. Should probably add an extra arg to
+    # _prepare_beamformer_input at some point (later)
+    picks = _check_info_inv(info, forward, data_cov, noise_cov)
+    info = pick_info(info, picks)
+    data_rank = compute_rank(data_cov, rank=rank, info=info)
+    noise_rank = compute_rank(noise_cov, rank=rank, info=info)
+    for key in data_rank:
+        if (
+            key not in noise_rank or data_rank[key] != noise_rank[key]
+        ) and not allow_mismatch:
+            raise ValueError(
+                f"{key} data rank ({data_rank[key]}) did not match the noise rank ("
+                f"{noise_rank.get(key, None)})"
+            )
+    del noise_rank
+    rank = data_rank
+    logger.info(f"Making LCMV beamformer with rank {rank}")
+    del data_rank
+    depth = _check_depth(depth, "depth_sparse")
+    if inversion == "single":
+        depth["combine_xyz"] = False
+
+    (
+        is_free_ori,
+        info,
+        proj,
+        vertno,
+        G,
+        whitener,
+        nn,
+        orient_std,
+    ) = _prepare_beamformer_input(
+        info,
+        forward,
+        label,
+        pick_ori,
+        noise_cov=noise_cov,
+        rank=rank,
+        pca=False,
+        **depth,
+    )
+
+    # obtain cata covariance from channels in info
+    ch_names = list(info["ch_names"])
+    data_cov = pick_channels_cov(data_cov, include=ch_names)
+    Cm = data_cov._get_square()
+
+    # determine number of orientations
+    n_orient = 3 if is_free_ori else 1
+
+    # TODO: for now only one target source
+
+    # get the null indices 
+    null_idx = _get_label_idxs(null_label, forward['src'])
+
+    # compute beamformer weights with nulling constraints
+    W, max_power_ori = _compute_nulling_beamformer(
+        G,
+        Cm,
+        null_idx,
+        target_source,
+        pick_ori,
+        n_orient,
     )
     
-    # Return modified Beamformer object
-    filters = Beamformer(
-        kind="nulling",  # Different kind
-        weights=W,
-        null_sources=null_sources,  # Additional info
-        null_orientations=null_orientations,
-        # ... rest same as LCMV
-    )
+    return W, max_power_ori
+
+def _get_label_idxs(null_label, src):
+    """Get the indices of the vertices in the null label."""
     
-    return filters
+    null_idxs = []
+    for hemi_idx, hemi in enumerate(src):
+        hemi_name = 'lh' if hemi_idx == 0 else 'rh'
+        if null_label.hemi != hemi_name:
+            continue
+        # get the vertex numbers in the label
+        label_verts = null_label.get_vertices_used()
+        # get the vertex numbers in the source space
+        src_verts = hemi["vertno"]
+        # find the indices of the label vertices in the source space
+        mask = np.isin(src_verts, label_verts)
+        null_idxs = np.where(mask)[0]
+
+    return null_idxs

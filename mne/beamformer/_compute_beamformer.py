@@ -449,6 +449,81 @@ def _compute_beamformer(
     logger.info("Filter computation complete")
     return W, max_power_ori
 
+def _compute_nulling_beamformer(
+    G,
+    Cm, 
+    null_idxs,
+    target_idx,
+    pick_ori,
+    n_orient
+):
+    """Compute a nulling beamformer filter.
+    G : ndarray, shape (n_dipoles, n_channels)
+        The leadfield.
+    Cm : ndarray, shape (n_channels, n_channels)
+        The data covariance matrix.
+    null_idxs : list of int
+        Indices of sources to be nulled.
+    n_orient : int
+        Number of dipole orientations defined at each source point
+    
+    Returns
+    -------
+    W : ndarray, shape (n_dipoles, n_channels)
+        The nulling beamformer filter weights.
+    """
+    
+    #################################
+    # Weight normalization
+    #################################
+
+
+    #################################
+    # Deal with Orientations
+    #################################
+    n_nulls = len(null_idxs)
+    n_channels = Cm.shape[0]
+
+    # for now I only deal with:
+    # - one target source
+    # - several nulling sources
+    # - one orientation
+
+
+    #################################################
+    # we now solve the optimization problem using Lagrange multipliers
+    # W = argmin_W  W^T Cm W
+
+    # compute inverse of covariance matrix
+    Cm_inv = np.linalg.pinv(Cm)
+    # get the G with the columns corresponding to the null indices
+    
+    
+
+    G_null = G[null_idxs, :].T  # shape (n_channels, n_nulls)
+    g_target = G[:, target_idx].reshape(-1, 1) # shape (n_channels, n_targets)
+    assert g_target.shape == (n_orient, n_channels)  # (n_orient, n_channels)
+    assert G_null.shape == (n_channels, n_nulls)  # (n_channels, n_nulls)
+
+    # combine target and null lead fields
+    G_all = np.hstack([g_target, G_null]) 
+    assert G_all.shape == (n_nulls + 1, n_orient, n_channels)
+
+    # define the constraint matrix
+    d = np.array([1.0] + [0.0] * len(null_idxs))
+
+    # define the nominator and denominator of the Lagrange function
+    bf_numer = Cm_inv @ G
+    bf_denom = G.T @ Cm_inv @ G
+    bf_denom_inv = np.linalg.pinv(bf_denom)
+
+    W = np.matmul(bf_denom_inv, bf_numer)
+
+    #TODO: compute max power orientation (same as in _compute_beamformer)
+    max_power_ori = None
+    
+    return W, max_power_ori
+
 
 def _compute_power(Cm, W, n_orient):
     """Use beamformer filters to compute source power.
