@@ -500,7 +500,7 @@ def _compute_nulling_beamformer(
     
     
 
-    G_null = G[null_idxs, :].T  # shape (n_channels, n_nulls)
+    G_null = G[:, null_idxs]  # shape (n_channels, n_nulls)
     g_target = G[:, target_idx].reshape(-1, 1) # shape (n_channels, n_targets)
     assert g_target.shape == (n_orient, n_channels)  # (n_orient, n_channels)
     assert G_null.shape == (n_channels, n_nulls)  # (n_channels, n_nulls)

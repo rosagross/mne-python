@@ -35,7 +35,7 @@ def make_nulling_beamformer(
     forward,
     data_cov,
     null_label,
-    target_source,
+    target_label,
     noise_cov=None,
     pick_ori=None,
     inversion="single", # TODO: this is only for now! 
@@ -135,6 +135,20 @@ def make_nulling_beamformer(
     n_orient = 3 if is_free_ori else 1
 
     # TODO: for now only one target source
+    # get the vertex id of the target
+    target_idx = None
+    src = forward['src']
+    for hemi_idx, hemi in enumerate(src):
+        hemi_name = 'lh' if hemi_idx == 0 else 'rh'
+        if target_label.hemi != hemi_name:
+            continue
+        # get the vertex numbers in the label
+        label_vertex = target_label.get_vertices_used(vertices=src[hemi_idx]['vertno'])[0]
+        # get the vertex numbers in the source space
+        src_verts = hemi["vertno"]
+        # find the index of the target label vertex in the source space
+        mask = np.isin(src_verts, label_vertex)
+        target_idx = np.where(mask)[0]
 
     # get the null indices 
     null_idx = _get_label_idxs(null_label, forward['src'])
@@ -144,7 +158,7 @@ def make_nulling_beamformer(
         G,
         Cm,
         null_idx,
-        target_source,
+        target_idx,
         pick_ori,
         n_orient,
     )
