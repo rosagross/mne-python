@@ -451,43 +451,145 @@ def _compute_beamformer(
 
 def _compute_nulling_beamformer(
     G,
-    Cm, 
+    Cm,
     null_idxs,
-    target_idx,
+    reg,
+    n_orient,
+    weight_norm,
     pick_ori,
-    n_orient
+    reduce_rank,
+    rank,
+    inversion,
+    nn,
+    orient_std,
+    whitener,
 ):
-    """Compute a nulling beamformer filter.
+    """Compute a spatial beamformer filter (LCMV or DICS).
+
+    For more detailed information on the parameters, see the docstrings of
+    `make_lcmv` and `make_dics`.
+
+    Parameters
+    ----------
     G : ndarray, shape (n_dipoles, n_channels)
         The leadfield.
     Cm : ndarray, shape (n_channels, n_channels)
         The data covariance matrix.
-    null_idxs : list of int
-        Indices of sources to be nulled.
+    reg : float
+        Regularization parameter.
     n_orient : int
         Number of dipole orientations defined at each source point
-    
+    weight_norm : None | 'unit-noise-gain' | 'nai'
+        The weight normalization scheme to use.
+    pick_ori : None | 'normal' | 'max-power'
+        The source orientation to compute the beamformer in.
+    reduce_rank : bool
+        Whether to reduce the rank by one during computation of the filter.
+    rank : dict | None | 'full' | 'info'
+        See compute_rank.
+    inversion : 'matrix' | 'single'
+        The inversion scheme to compute the weights.
+    nn : ndarray, shape (n_dipoles, 3)
+        The source normals.
+    orient_std : ndarray, shape (n_dipoles,)
+        The std of the orientation prior used in weighting the lead fields.
+    whitener : ndarray, shape (n_channels, n_channels)
+        The whitener.
+
     Returns
     -------
     W : ndarray, shape (n_dipoles, n_channels)
-        The nulling beamformer filter weights.
+        The beamformer filter weights.
     """
+    _check_option(
+        "weight_norm",
+        weight_norm,
+        ["unit-noise-gain-invariant", "unit-noise-gain", "nai", None],
+    )
+
+    # Whiten the data covariance
+    Cm = whitener @ Cm @ whitener.T.conj()
+    # Restore to properly Hermitian as large whitening coefs can have bad
+    # rounding error
+    Cm[:] = (Cm + Cm.T.conj()) / 2.0
+
+    assert Cm.shape == (G.shape[0],) * 2
+    s, _ = np.linalg.eigh(Cm)
+    if not (s >= -s.max() * 1e-7).all():
+        # This shouldn't ever happen, but just in case
+        warn(
+            "data covariance does not appear to be positive semidefinite, "
+            "results will likely be incorrect"
+        )
+    # Tikhonov regularization using reg parameter to control for
+    # trade-off between spatial resolution and noise sensitivity
+    # eq. 25 in Gross and Ioannides, 1999 Phys. Med. Biol. 44 2081
+    Cm_inv, loading_factor, rank = _reg_pinv(Cm, reg, rank)
+
+    assert orient_std.shape == (G.shape[1],)
+    n_sources = G.shape[1] // n_orient
+    assert nn.shape == (n_sources, 3)
+
+    logger.info(f"Computing beamformer filters for {n_sources} source{_pl(n_sources)}")
+    n_channels = G.shape[0]
+    assert n_orient in (3, 1)
+    Gk = np.reshape(G.T, (n_sources, n_orient, n_channels)).transpose(0, 2, 1)
+    assert Gk.shape == (n_sources, n_channels, n_orient)
+    sk = np.reshape(orient_std, (n_sources, n_orient))
+    del G, orient_std
+
+    _check_option("reduce_rank", reduce_rank, (True, False))
+
+    # inversion of the denominator
+    _check_option("inversion", inversion, ("matrix", "single"))
+    if (
+        inversion == "single"
+        and n_orient > 1
+        and pick_ori == "vector"
+        and weight_norm == "unit-noise-gain-invariant"
+    ):
+        raise ValueError(
+            'Cannot use pick_ori="vector" with inversion="single" and '
+            'weight_norm="unit-noise-gain-invariant"'
+        )
+    if reduce_rank and inversion == "single":
+        raise ValueError(
+            'reduce_rank cannot be used with inversion="single"; '
+            'consider using inversion="matrix" if you have a '
+            "rank-deficient forward model (i.e., from a sphere "
+            "model with MEG channels), otherwise consider using "
+            "reduce_rank=False"
+        )
+    if n_orient > 1:
+        _, Gk_s, _ = np.linalg.svd(Gk, full_matrices=False)
+        assert Gk_s.shape == (n_sources, n_orient)
+        if not reduce_rank and (Gk_s[:, 0] > 1e6 * Gk_s[:, 2]).any():
+            raise ValueError(
+                "Singular matrix detected when estimating spatial filters. "
+                "Consider reducing the rank of the forward operator by using "
+                "reduce_rank=True."
+            )
+        del Gk_s
+
+    #
+    # 1. Reduce rank of the lead field
+    #
+    if reduce_rank:
+        Gk = _reduce_leadfield_rank(Gk)
+
+    def _compute_bf_terms(Gk, Cm_inv):
+        bf_numer = np.matmul(Gk.swapaxes(-2, -1).conj(), Cm_inv)
+        bf_denom = np.matmul(bf_numer, Gk)
+        return bf_numer, bf_denom
     
-    #################################
-    # Weight normalization
-    #################################
-
-
-    #################################
-    # Deal with Orientations
-    #################################
+    
     n_nulls = len(null_idxs)
-    n_channels, n_sources = G.shape
+    n_sources = Gk.shape[0]
 
     # for now I only deal with:
-    # - one target source
     # - several nulling sources
     # - one orientation
+    G = Gk.reshape(n_sources, n_channels).T
 
 
     #################################################
@@ -533,16 +635,82 @@ def _compute_nulling_beamformer(
     # compute final weights
     W = np.sum(bf_numer * bf_denom_inv[:,None,:], axis=2)
     # same as but fast when not so many nulls: W = np.matmul(bf_numer, bf_denom_inv[:,:,None])
-    
+    W = W.reshape(n_sources, n_orient, n_channels)
+    assert W.shape == (n_sources, n_orient, n_channels)
+
+    #
+    # 5. Re-scale filter weights according to the selected weight_norm
+    #
+
+    # Weight normalization is done by computing, for each source::
+    #
+    #     W_ung = W_ug / sqrt(W_ug @ W_ug.T)
+    #
+    # with W_ung referring to the unit-noise-gain (weight normalized) filter
+    # and W_ug referring to the above-calculated unit-gain filter stored in W.
+
+    if weight_norm is not None:
+        # Three different ways to calculate the normalization factors here.
+        # Only matters when in vector mode, as otherwise n_orient == 1 and
+        # they are all equivalent.
+        #
+        # In MNE < 0.21, we just used the Frobenius matrix norm:
+        #
+        #    noise_norm = np.linalg.norm(W, axis=(1, 2), keepdims=True)
+        #    assert noise_norm.shape == (n_sources, 1, 1)
+        #    W /= noise_norm
+        #
+        # Sekihara 2008 says to use sqrt(diag(W_ug @ W_ug.T)), which is not
+        # rotation invariant:
+        if weight_norm in ("unit-noise-gain", "nai"):
+            noise_norm = np.matmul(W, W.swapaxes(-2, -1).conj()).real
+            noise_norm = np.reshape(  # np.diag operation over last two axes
+                noise_norm, (n_sources, -1, 1)
+            )[:, :: n_orient + 1]
+            np.sqrt(noise_norm, out=noise_norm)
+            noise_norm[noise_norm == 0] = np.inf
+            assert noise_norm.shape == (n_sources, n_orient, 1)
+            W /= noise_norm
+        else:
+            # TODO: implement unit-noise-gain-invariant for nulling beamformer
+            raise NotImplementedError(
+                "unit-noise-gain-invariant not implemented for nulling beamformer"
+            )
+
+        if weight_norm == "nai":
+            # Estimate noise level based on covariance matrix, taking the
+            # first eigenvalue that falls outside the signal subspace or the
+            # loading factor used during regularization, whichever is largest.
+            if rank > len(Cm):
+                # Covariance matrix is full rank, no noise subspace!
+                # Use the loading factor as noise ceiling.
+                if loading_factor == 0:
+                    raise RuntimeError(
+                        "Cannot compute noise subspace with a full-rank "
+                        "covariance matrix and no regularization. Try "
+                        "manually specifying the rank of the covariance "
+                        "matrix or using regularization."
+                    )
+                noise = loading_factor
+            else:
+                noise, _ = np.linalg.eigh(Cm)
+                noise = noise[-rank]
+                noise = max(noise, loading_factor)
+            W /= np.sqrt(noise)
+
+
     # Verify constraints
-    gain_target = np.sum(W * G.T, axis=1)
-    gain_nulls = W @ G_null
-    print('Gain at target source (should be 1): ', gain_target)
-    print('Gain at nulling sources (should be 0): ', gain_nulls)
+    #gain_target = np.sum(W * G.T, axis=1)
+    #gain_nulls = W @ G_null
+    #print('Gain at target source (should be 1): ', gain_target)
+    #print('Gain at nulling sources (should be 0): ', gain_nulls)
 
     #TODO: compute max power orientation (same as in _compute_beamformer)
     max_power_ori = None
     
+    W = W.reshape(n_sources * n_orient, n_channels)
+    logger.info("Filter computation complete")
+
     return W, max_power_ori
 
 

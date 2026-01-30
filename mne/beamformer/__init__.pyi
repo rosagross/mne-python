@@ -5,6 +5,7 @@ __all__ = [
     "apply_dics_epochs",
     "apply_dics_tfr_epochs",
     "apply_lcmv",
+    "apply_nulling",
     "apply_lcmv_cov",
     "apply_lcmv_epochs",
     "apply_lcmv_raw",
@@ -32,7 +33,12 @@ from ._lcmv import (
     make_lcmv,
 )
 
-from ._nulling import make_nulling_beamformer
+from ._nulling import (
+    make_nulling_beamformer, 
+    apply_nulling
+)
+    
+
 
 from ._rap_music import rap_music, trap_music
 from .resolution_matrix import make_lcmv_resolution_matrix

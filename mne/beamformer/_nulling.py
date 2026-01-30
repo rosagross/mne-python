@@ -35,13 +35,16 @@ def make_nulling_beamformer(
     forward,
     data_cov,
     null_label,
-    target_label,
+    reg=0.05,
     noise_cov=None,
-    pick_ori=None,
-    inversion="single", # TODO: this is only for now! 
-    rank="info",
     label=None,
+    pick_ori=None,
+    rank="info",
+    weight_norm="unit-noise-gain",
+    reduce_rank=False,
     depth=None,
+    inversion="matrix",
+    verbose=None,
 ):
     """Compute nulling beamformer spatial filter.
     
@@ -134,38 +137,30 @@ def make_nulling_beamformer(
     # determine number of orientations
     n_orient = 3 if is_free_ori else 1
 
-    # TODO: for now only one target source
-    # get the vertex id of the target
-    target_idx = None
-    src = forward['src']
-    for hemi_idx, hemi in enumerate(src):
-        hemi_name = 'lh' if hemi_idx == 0 else 'rh'
-        if target_label.hemi != hemi_name:
-            continue
-        # get the vertex numbers in the label
-        label_vertex = target_label.get_vertices_used(vertices=src[hemi_idx]['vertno'])[0]
-        # get the vertex numbers in the source space
-        src_verts = hemi["vertno"]
-        # find the index of the target label vertex in the source space
-        mask = np.isin(src_verts, label_vertex)
-        target_idx = np.where(mask)[0]
-
     # get the null indices 
-    null_idx = _get_label_idxs(null_label, forward['src'])
+    null_idxs = _get_label_idxs(null_label, forward['src'])
     
     # compute rank
     rank_int = sum(rank.values())
     del rank
-    
+
     # compute beamformer weights with nulling constraints
     W, max_power_ori = _compute_nulling_beamformer(
         G,
         Cm,
-        null_idx,
-        target_idx,
-        pick_ori,
+        null_idxs,
+        reg,
         n_orient,
+        weight_norm,
+        pick_ori,
+        reduce_rank,
+        rank_int,
+        inversion=inversion,
+        nn=nn,
+        orient_std=orient_std,
+        whitener=whitener,
     )
+    
 
     # get src type to store with filters for _make_stc
     src_type = _get_src_type(forward["src"], vertno)
@@ -178,7 +173,7 @@ def make_nulling_beamformer(
     is_ssp = bool(info["projs"])
 
     filters = Beamformer(
-        kind="LCMV",
+        kind="LCMV", # TODO: change!
         weights=W,
         data_cov=data_cov,
         noise_cov=noise_cov,
@@ -218,3 +213,97 @@ def _get_label_idxs(null_label, src):
         null_idxs = np.where(mask)[0]
 
     return null_idxs
+
+
+def _apply_nulling(data, filters, info, tmin):
+    """Apply nulling spatial filter to data for source reconstruction."""
+    if isinstance(data, np.ndarray) and data.ndim == 2:
+        data = [data]
+        return_single = True
+    else:
+        return_single = False
+
+    W = filters["weights"]
+
+    for i, M in enumerate(data):
+        if len(M) != len(filters["ch_names"]):
+            raise ValueError("data and picks must have the same length")
+
+        if not return_single:
+            logger.info(f"Processing epoch : {i + 1}")
+
+        M = _proj_whiten_data(M, info["projs"], filters)
+
+        # project to source space using beamformer weights
+        vector = False
+        if filters["is_free_ori"]:
+            sol = np.dot(W, M)
+            if filters["pick_ori"] == "vector":
+                vector = True
+            else:
+                logger.info("combining the current components...")
+                sol = combine_xyz(sol)
+        else:
+            # Linear inverse: do computation here or delayed
+            if M.shape[0] < W.shape[0] and filters["pick_ori"] != "max-power":
+                sol = (W, M)
+            else:
+                sol = np.dot(W, M)
+
+        tstep = 1.0 / info["sfreq"]
+
+        # compatibility with 0.16, add src_type as None if not present:
+        filters, warn_text = _check_src_type(filters)
+
+        yield _make_stc(
+            sol,
+            vertices=filters["vertices"],
+            tmin=tmin,
+            tstep=tstep,
+            subject=filters["subject"],
+            vector=vector,
+            source_nn=filters["source_nn"],
+            src_type=filters["src_type"],
+            warn_text=warn_text,
+        )
+
+    logger.info("[done]")
+
+
+@verbose
+def apply_nulling(evoked, filters, *, verbose=None):
+    """Apply nulling beamformer weights (constrained LCMV).
+
+    Parameters
+    ----------
+    evoked : Evoked
+        Evoked data to invert.
+    filters : instance of Beamformer
+        Nulling beamformer spatial filter (beamformer weights).
+        Filter weights returned from :func:`make_nulling`.
+    %(verbose)s
+
+    Returns
+    -------
+    stc : SourceEstimate | VolSourceEstimate | VectorSourceEstimate
+        Source time courses.
+
+    See Also
+    --------
+    make_nulling, apply_nulling_raw
+
+    Notes
+    -----
+    """
+    _check_reference(evoked)
+
+    info = evoked.info
+    data = evoked.data
+    tmin = evoked.times[0]
+
+    sel = _check_channels_spatial_filter(evoked.ch_names, filters)
+    data = data[sel]
+
+    stc = _apply_nulling(data=data, filters=filters, info=info, tmin=tmin)
+
+    return next(stc)
