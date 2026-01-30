@@ -482,7 +482,7 @@ def _compute_nulling_beamformer(
     # Deal with Orientations
     #################################
     n_nulls = len(null_idxs)
-    n_channels = Cm.shape[0]
+    n_channels, n_sources = G.shape
 
     # for now I only deal with:
     # - one target source
@@ -498,26 +498,47 @@ def _compute_nulling_beamformer(
     Cm_inv = np.linalg.pinv(Cm)
     # get the G with the columns corresponding to the null indices
     
-    
-
     G_null = G[:, null_idxs]  # shape (n_channels, n_nulls)
-    g_target = G[:, target_idx].reshape(-1, 1) # shape (n_channels, n_targets)
-    assert g_target.shape == (n_orient, n_channels)  # (n_orient, n_channels)
+    #g_target = G[:, target_idx] # shape (n_channels, n_targets)
+    #assert g_target.shape == (n_channels, 1)  # (n_orient, n_channels, n_targets)
     assert G_null.shape == (n_channels, n_nulls)  # (n_channels, n_nulls)
 
     # combine target and null lead fields
-    G_all = np.hstack([g_target, G_null]) 
-    assert G_all.shape == (n_nulls + 1, n_orient, n_channels)
+    g_prep = G.T[:, :, None]
+    g_null_all = np.repeat(
+                G_null[None, :, :],               # (1, n_nulls, n_channels)
+                n_sources,
+                axis=0
+            )
+    G_all = np.concatenate(
+        [
+            g_prep,                 # (n_sources, n_channels, 1)
+            g_null_all                   # (n_sources, n_channels, n_nulls)
+        ],
+        axis=2
+    )
+
+
+    #G_all = np.hstack([g_target, G_null]) # only for one source
+    assert G_all.shape == (n_sources, n_channels, n_nulls + 1)
 
     # define the constraint matrix
-    d = np.array([1.0] + [0.0] * len(null_idxs))
+    f = np.array([1.0] + [0.0] * len(null_idxs))
 
     # define the nominator and denominator of the Lagrange function
-    bf_numer = Cm_inv @ G
-    bf_denom = G.T @ Cm_inv @ G
-    bf_denom_inv = np.linalg.pinv(bf_denom)
-
-    W = np.matmul(bf_denom_inv, bf_numer)
+    bf_numer = Cm_inv @ G_all
+    bf_denom = G_all.transpose(0, 2, 1) @ Cm_inv @ G_all
+    bf_denom_inv = np.linalg.pinv(bf_denom) @ f
+    
+    # compute final weights
+    W = np.sum(bf_numer * bf_denom_inv[:,None,:], axis=2)
+    # same as but fast when not so many nulls: W = np.matmul(bf_numer, bf_denom_inv[:,:,None])
+    
+    # Verify constraints
+    gain_target = np.sum(W * G.T, axis=1)
+    gain_nulls = W @ G_null
+    print('Gain at target source (should be 1): ', gain_target)
+    print('Gain at nulling sources (should be 0): ', gain_nulls)
 
     #TODO: compute max power orientation (same as in _compute_beamformer)
     max_power_ori = None

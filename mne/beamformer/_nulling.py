@@ -152,7 +152,11 @@ def make_nulling_beamformer(
 
     # get the null indices 
     null_idx = _get_label_idxs(null_label, forward['src'])
-
+    
+    # compute rank
+    rank_int = sum(rank.values())
+    del rank
+    
     # compute beamformer weights with nulling constraints
     W, max_power_ori = _compute_nulling_beamformer(
         G,
@@ -162,8 +166,40 @@ def make_nulling_beamformer(
         pick_ori,
         n_orient,
     )
+
+    # get src type to store with filters for _make_stc
+    src_type = _get_src_type(forward["src"], vertno)
+
+    # get subject to store with filters
+    subject_from = _subject_from_forward(forward)
+
+    # Is the computed beamformer a scalar or vector beamformer?
+    is_free_ori = is_free_ori if pick_ori in [None, "vector"] else False
+    is_ssp = bool(info["projs"])
+
+    filters = Beamformer(
+        kind="LCMV",
+        weights=W,
+        data_cov=data_cov,
+        noise_cov=noise_cov,
+        whitener=whitener,
+        weight_norm=None,
+        pick_ori=None,
+        ch_names=ch_names,
+        proj=proj,
+        is_ssp=is_ssp,
+        vertices=vertno,
+        is_free_ori=is_free_ori,
+        n_sources=forward["nsource"],
+        src_type=src_type,
+        source_nn=forward["source_nn"].copy(),
+        subject=subject_from,
+        rank=rank_int,
+        max_power_ori=max_power_ori,
+        inversion=inversion,
+    )
     
-    return W, max_power_ori
+    return filters
 
 def _get_label_idxs(null_label, src):
     """Get the indices of the vertices in the null label."""
