@@ -582,6 +582,9 @@ def _compute_nulling_beamformer(
         bf_denom = np.matmul(bf_numer, Gk)
         return bf_numer, bf_denom
     
+    #
+    # 2. Reorient lead field in direction of max power or normal
+    # TODO: still to implement for nulling beamformer
     
     n_nulls = len(null_idxs)
     n_sources = Gk.shape[0]
@@ -589,7 +592,7 @@ def _compute_nulling_beamformer(
     # for now I only deal with:
     # - several nulling sources
     # - one orientation
-    G = Gk.reshape(n_sources, n_channels).T
+    G = Gk.reshape(n_sources, n_channels, n_orient)
 
 
     #################################################
@@ -598,46 +601,78 @@ def _compute_nulling_beamformer(
 
     # compute inverse of covariance matrix
     Cm_inv = np.linalg.pinv(Cm)
+
+
     # get the G with the columns corresponding to the null indices
     
-    G_null = G[:, null_idxs]  # shape (n_channels, n_nulls)
+    G_null = G[null_idxs, :, :]  # shape (n_nulls, n_channels, n_orient)
     #g_target = G[:, target_idx] # shape (n_channels, n_targets)
-    #assert g_target.shape == (n_channels, 1)  # (n_orient, n_channels, n_targets)
-    assert G_null.shape == (n_channels, n_nulls)  # (n_channels, n_nulls)
+    #assert g_target.shape == (n_channels, 1)  # (n_channels, n_orient, n_targets)
+    assert G_null.shape == (n_nulls, n_channels, n_orient)  # (n_nulls, n_channels, n_orient)
 
     # combine target and null lead fields
-    g_prep = G.T[:, :, None]
+    g_prep = G[:, None, :, :]
     g_null_all = np.repeat(
-                G_null[None, :, :],               # (1, n_nulls, n_channels)
+                G_null[None, :, :, :],               # (1, n_channels, n_orient, n_nulls)
                 n_sources,
                 axis=0
             )
     G_all = np.concatenate(
         [
-            g_prep,                 # (n_sources, n_channels, 1)
-            g_null_all                   # (n_sources, n_channels, n_nulls)
+            g_prep,                 # (1,  n_nulls, n_channels, n_orient)
+            g_null_all                   # (n_sources, n_nulls, n_channels, n_orient)
         ],
-        axis=2
+        axis=1
     )
 
 
     #G_all = np.hstack([g_target, G_null]) # only for one source
-    assert G_all.shape == (n_sources, n_channels, n_nulls + 1)
+    assert G_all.shape == (n_sources, n_nulls + 1, n_channels, n_orient)
 
     # define the constraint matrix
     f = np.array([1.0] + [0.0] * len(null_idxs))
 
     # define the nominator and denominator of the Lagrange function
-    bf_numer = Cm_inv @ G_all
-    bf_denom = G_all.transpose(0, 2, 1) @ Cm_inv @ G_all
-    bf_denom_inv = np.linalg.pinv(bf_denom) @ f
-    
-    # compute final weights
-    W = np.sum(bf_numer * bf_denom_inv[:,None,:], axis=2)
-    # same as but fast when not so many nulls: W = np.matmul(bf_numer, bf_denom_inv[:,:,None])
-    W = W.reshape(n_sources, n_orient, n_channels)
-    assert W.shape == (n_sources, n_orient, n_channels)
+    #bf_numer =  Cm_inv @ G_all
+    #bf_denom = G_all.transpose(0, 2, 1) @ Cm_inv @ G_all
+    #bf_denom_inv = np.linalg.pinv(bf_denom) @ f
+    bf_numer = np.matmul(G_all.swapaxes(-2, -1).conj(), Cm_inv)
 
+    W = np.zeros((n_sources, n_orient, n_channels))  # (n_sources, n_orient, n_chan)
+
+    for s in range(n_sources):
+        # for each source add the nulling constraints
+        G_s = G_all[s]
+        numer_s = bf_numer[s]  
+        assert G_s.shape == (n_nulls + 1, n_channels, n_orient)
+        assert numer_s.shape == (n_nulls + 1, n_orient, n_channels)
+
+        # put orientation in the front
+        G_s_o  = np.moveaxis(G_s, 2, 0)   
+        numer_s_o = np.moveaxis(numer_s, 1, 0)
+        assert G_s_o.shape == (n_orient, n_nulls + 1, n_channels)
+        assert numer_s_o.shape == (n_orient, n_nulls + 1, n_channels)
+
+        f = np.array([1.0] + [0.0] * len(null_idxs))
+
+        for o in range(n_orient):
+            # for each orientation compute the denominator
+            G_single = G_s_o[o].T                   # (n_chan, K)
+            numer_single = numer_s_o[o].T                 # (n_chan, K) == C_reg @ A
+            assert G_single.shape == (n_channels, n_nulls + 1)
+            assert numer_single.shape == (n_channels, n_nulls + 1)
+            
+            # tmp = Aᵀ C A: (K, K)
+            denom = G_single.T @ numer_single                   # (K, K)
+            denom_inv = np.linalg.pinv(denom)    # (K, K)
+            assert denom_inv.shape == (n_nulls + 1, n_nulls + 1)
+
+            # w = C A tmp_inv d = CA tmp_inv d
+            w = numer_single @ (denom_inv @ f)           # (n_chan, 1)
+            W[s, o, :] = w
+
+    
+    ###################################################
     #
     # 5. Re-scale filter weights according to the selected weight_norm
     #
