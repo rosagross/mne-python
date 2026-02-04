@@ -590,8 +590,6 @@ def _compute_nulling_beamformer(
     n_sources = Gk.shape[0]
 
     # for now I only deal with:
-    # - several nulling sources
-    # - one orientation
     G = Gk.reshape(n_sources, n_channels, n_orient)
 
 
@@ -604,11 +602,31 @@ def _compute_nulling_beamformer(
 
 
     # get the G with the columns corresponding to the null indices
-    
     G_null = G[null_idxs, :, :]  # shape (n_nulls, n_channels, n_orient)
     #g_target = G[:, target_idx] # shape (n_channels, n_targets)
     #assert g_target.shape == (n_channels, 1)  # (n_channels, n_orient, n_targets)
     assert G_null.shape == (n_nulls, n_channels, n_orient)  # (n_nulls, n_channels, n_orient)
+    
+    # eigenvector decomposition
+    G_null_flat = G_null.reshape(n_nulls * n_orient, n_channels).T
+    eigvals, eigvecs = np.linalg.eigh(G_null_flat @ G_null_flat.T)
+    idx = np.argsort(eigvals)[::-1]
+    eigvals, eigvecs = eigvals[idx], eigvecs[:, idx]
+    
+    # Select top-k = 5 subspace spanning nulling interference
+    eigvals, eigvecs = np.linalg.eigh(G_null_flat @ G_null_flat.T)  # (n_channels, n_channels)
+    idx = np.argsort(eigvals)[::-1]
+    eigvals, eigvecs = eigvals[idx], eigvecs[:, idx]
+
+    # Raw top-k eigenvectors: perfect spanning vectors (k_null, n_channels)
+    k_null = np.where(np.cumsum(eigvals) / eigvals.sum() > 0.99)[0][0]
+    G_null_pca = eigvecs[:, :k_null].T  # (k_null, n_channels) ✓
+
+    # Broadcast to orientations (treat as orientation-invariant constraints)
+    G_null_pca = G_null_pca[:, None, :].repeat(n_orient, axis=1)  # (k_null, n_orient, n_channels)
+    G_null_pca = np.transpose(G_null_pca, (0, 2, 1)) # (k_null, n_channels, n_orient)
+    #n_nulls = G_null_pca.shape[0] # or k_null
+    print(f"Using {k_null} orthonormal eigenvectors spanning {100*np.cumsum(eigvals)[k_null-1]/eigvals.sum():.1f}% variance")
 
     # combine target and null lead fields
     g_prep = G[:, None, :, :]
@@ -630,12 +648,9 @@ def _compute_nulling_beamformer(
     assert G_all.shape == (n_sources, n_nulls + 1, n_channels, n_orient)
 
     # define the constraint matrix
-    f = np.array([1.0] + [0.0] * len(null_idxs))
+    f = np.array([1.0] + [0.0] * n_nulls)
 
-    # define the nominator and denominator of the Lagrange function
-    #bf_numer =  Cm_inv @ G_all
-    #bf_denom = G_all.transpose(0, 2, 1) @ Cm_inv @ G_all
-    #bf_denom_inv = np.linalg.pinv(bf_denom) @ f
+    # define the numerator of the Lagrange function
     bf_numer = np.matmul(G_all.swapaxes(-2, -1).conj(), Cm_inv)
 
     W = np.zeros((n_sources, n_orient, n_channels))  # (n_sources, n_orient, n_chan)
@@ -653,7 +668,7 @@ def _compute_nulling_beamformer(
         assert G_s_o.shape == (n_orient, n_nulls + 1, n_channels)
         assert numer_s_o.shape == (n_orient, n_nulls + 1, n_channels)
 
-        f = np.array([1.0] + [0.0] * len(null_idxs))
+        f = np.array([1.0] + [0.0] * n_nulls)
 
         for o in range(n_orient):
             # for each orientation compute the denominator
@@ -670,6 +685,16 @@ def _compute_nulling_beamformer(
             # w = C A tmp_inv d = CA tmp_inv d
             w = numer_single @ (denom_inv @ f)           # (n_chan, 1)
             W[s, o, :] = w
+
+            # verify weights
+            gain_target = w.T @ G_s_o[o, 0, :].T
+            gain_nulls = w.T @ G_s_o[o, 1:, :].T
+            
+            if (gain_nulls > 1e-5).any():
+                print(f"Warning: high gain at nulling source for source {s}, orientation {o}: {gain_nulls}")
+
+            #print('Gain at target source (should be 1): ', gain_target)
+            #print('Gain at nulling sources (should be 0): ', gain_nulls)
 
     
     ###################################################
