@@ -601,56 +601,60 @@ def _compute_nulling_beamformer(
 
     # get the G with the columns corresponding to the null indices
     G_null = G[null_idxs, :, :]  # shape (n_nulls, n_channels, n_orient)
-    #g_target = G[:, target_idx] # shape (n_channels, n_targets)
-    #assert g_target.shape == (n_channels, 1)  # (n_channels, n_orient, n_targets)
     assert G_null.shape == (n_nulls, n_channels, n_orient)  # (n_nulls, n_channels, n_orient)
     
-    # Flatten for PCA
+    #g_target = G[:, target_idx] # shape (n_channels, n_targets)
+    #assert g_target.shape == (n_channels, 1)  # (n_channels, n_orient, n_targets)
+    
+    # Flatten for SVD 
     G_null_flat = G_null.reshape(n_nulls * n_orient, n_channels).T  # (n_channels, n_nulls * n_orient)
 
-    # Eigenvector decomposition
-    eigvals, eigvecs = np.linalg.eigh(G_null_flat @ G_null_flat.T)  # (n_channels, n_channels)
-    idx = np.argsort(eigvals)[::-1]
-    eigvals, eigvecs = eigvals[idx], eigvecs[:, idx]
-
+    # SVD decomposition
+    U, s, Vt = np.linalg.svd(G_null_flat, full_matrices=False)  # (n_channels, n_channels)
+    # s are singular values, U are left singular vectors, Vt are right singular vectors
+    
     # Determine number of components to use
     if null_reduction == "none" or null_reduction is None:
         # Use all components (no dimensionality reduction)
         k_null = n_nulls * n_orient
-        G_null_pca = G_null_flat.T  # (n_nulls * n_orient, n_channels) - use original
-        print(f"Using all {k_null} null components (no PCA reduction)")
+        G_null_svd = G_null_flat.T  # (n_nulls * n_orient, n_channels) - use original
+        print(f"G_null_svd shape: {G_null_svd.shape}")
+        print(f"Using all {k_null} null components (no SVD reduction)")
         
     elif null_reduction == "auto" or (isinstance(null_reduction, float) and 0 < null_reduction < 1):
         # Auto: use variance threshold (default 0.99)
         variance_threshold = null_reduction if isinstance(null_reduction, float) else 0.99
-        k_null = np.where(np.cumsum(eigvals) / eigvals.sum() > variance_threshold)[0][0] + 1
-        G_null_pca = eigvecs[:, :k_null].T  # (k_null, n_channels)
-        print(f"Using {k_null} PCA components spanning {100*np.cumsum(eigvals)[k_null-1]/eigvals.sum():.1f}% variance")
+        # Calculate explained variance from singular values
+        explained_variance_ratio = s**2 / np.sum(s**2)
+        k_null = np.where(np.cumsum(explained_variance_ratio) > variance_threshold)[0][0] + 1
+        G_null_svd = U[:, :k_null].T  # (k_null, n_channels)
+        print(f"Using {k_null} SVD components spanning {100*np.cumsum(explained_variance_ratio)[k_null-1]:.1f}% variance")
         
     elif isinstance(null_reduction, int):
         # Fixed number of components
         k_null = min(null_reduction, n_nulls * n_orient, n_channels)
-        G_null_pca = eigvecs[:, :k_null].T  # (k_null, n_channels)
-        var_explained = 100 * np.cumsum(eigvals)[k_null-1] / eigvals.sum()
-        print(f"Using {k_null} PCA components spanning {var_explained:.1f}% variance")
+        G_null_svd = U[:, :k_null].T  # (k_null, n_channels)
+        explained_variance_ratio = s**2 / np.sum(s**2)
+        var_explained = 100 * np.cumsum(explained_variance_ratio)[k_null-1]
+        print(f"Using {k_null} SVD components spanning {var_explained:.1f}% variance")
         
     else:
         raise ValueError(f"Invalid null_reduction: {null_reduction}. Use 'none', 'auto', float (0-1), or int.")
 
-    # Broadcast to orientations (if we did PCA reduction)
+    # Broadcast to orientations 
     if null_reduction != "none" and null_reduction is not None:
-        G_null_pca = G_null_pca[:, None, :].repeat(n_orient, axis=1)  # (k_null, n_orient, n_channels)
-        G_null_pca = G_null_pca.swapaxes(-2, -1)  # (k_null, n_channels, n_orient)
+        G_null_svd = G_null_svd[:, None, :].repeat(n_orient, axis=1)  # (k_null, n_orient, n_channels)
+        G_null_svd = G_null_svd.swapaxes(-2, -1)  # (k_null, n_channels, n_orient)
         n_nulls = k_null
     else:
         # Reshape back to original structure
-        G_null_pca = G_null_pca.reshape(n_nulls, n_channels, n_orient)
+        G_null_svd = G_null_svd.reshape(n_nulls, n_channels, n_orient)
         
 
     # combine target and null lead fields
     g_prep = G[:, None, :, :]
     g_null_all = np.repeat(
-                G_null_pca[None, :, :, :],               # (1, n_channels, n_orient, n_nulls)
+                G_null_svd[None, :, :, :],               # (1, n_channels, n_orient, n_nulls)
                 n_sources,
                 axis=0
             )
