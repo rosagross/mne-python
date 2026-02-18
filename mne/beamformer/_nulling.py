@@ -198,21 +198,26 @@ def make_nulling_beamformer(
     
     return filters
 
-def _get_label_idxs(null_label, src):
+def _get_label_idxs(null_labels, src):
     """Get the indices of the vertices in the null label."""
-    
+        
+    if type(null_labels) != list:
+        null_labels = [null_labels]
+
     null_idxs = []
     for hemi_idx, hemi in enumerate(src):
         hemi_name = 'lh' if hemi_idx == 0 else 'rh'
-        if null_label.hemi != hemi_name:
-            continue
-        # get the vertex numbers in the label
-        label_verts = null_label.get_vertices_used()
-        # get the vertex numbers in the source space
-        src_verts = hemi["vertno"]
-        # find the indices of the label vertices in the source space
-        mask = np.isin(src_verts, label_verts)
-        null_idxs = np.where(mask)[0]
+        for null_label in null_labels:
+            if null_label.hemi != hemi_name:
+                continue
+            # get the vertex numbers in the label
+            label_verts = null_label.get_vertices_used(hemi['vertno'])
+            # get the vertex numbers in the source space
+            src_verts = hemi["vertno"]
+            # find the indices of the label vertices in the source space
+            mask = np.isin(src_verts, label_verts)
+            null_label_idxs = np.where(mask)[0]
+            null_idxs.extend(null_label_idxs)
 
     return null_idxs
 
