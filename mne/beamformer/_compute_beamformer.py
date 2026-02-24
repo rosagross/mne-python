@@ -183,6 +183,54 @@ def _sym_inv_sm(x, reduce_rank, inversion, sk):
     return x_inv
 
 
+def _sym_inv_sm_nulling(x, n_nulls, reduce_rank, inversion, sk):
+    """Symmetric inversion with single- or matrix-style inversion."""
+    print('shape of x', x.shape)
+    if x.shape[1:] == (1*(n_nulls+1), 1*(n_nulls+1)):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_inv = 1.0 / x
+        x_inv[~np.isfinite(x_inv)] = 1.0
+    else:
+        assert x.shape[1:] == (3*(n_nulls+1), 3*(n_nulls+1))
+        if inversion == "matrix":
+            x_inv = _sym_mat_pow(x, -1, reduce_rank=reduce_rank)
+
+            # Expand sk (20484, 3) → (20484, 75) via repetition across nulls
+            n_orient = 3
+            idxs = np.arange((n_nulls+1)*n_orient)
+            sk_expanded = np.repeat(sk[:, np.newaxis, :], (n_nulls+1), axis=1)  # (20484, 25, 3)
+            sk_expanded = sk_expanded.reshape(x.shape[0], (n_nulls+1)*n_orient)  # (20484, 75)
+
+            diags = np.diagonal(x_inv, axis1=1, axis2=2).copy()
+            diags *= sk_expanded**2  # Element-wise
+            x_inv[:, idxs, idxs] = diags
+
+        else:
+            # TODO: TEST THIS!!!
+            raise NotImplementedError('not tested yet!')
+
+            # Invert for each dipole separately using plain division
+            diags = np.diagonal(x, axis1=1, axis2=2)
+            assert not reduce_rank  # guaranteed earlier
+            with np.errstate(divide="ignore"):
+                diags = 1.0 / diags
+            # set the diagonal of each 3x3
+            x_inv = np.zeros_like(x)
+            
+            sk_scalars = np.sum(sk**2, axis=1)  # (n_sources,)
+
+            diags = np.diagonal(x, axis1=1, axis2=2).copy()  # (n_sources, (n_nulls+1)*n_orient)
+            diags *= sk_scalars[:, np.newaxis]  # (n_sources, 1) → broadcasts to (n_sources, (n_nulls+1)*n_orient)
+
+            # Set all diagonals
+            idxs = np.arange((n_nulls+1)*n_orient)
+            idxs = np.arange((n_nulls+1)*n_orient)  
+            x_inv[:, idxs, idxs] = diags
+
+
+    return x_inv
+
+
 def _compute_beamformer(
     G,
     Cm,
@@ -584,9 +632,49 @@ def _compute_nulling_beamformer(
         bf_denom = np.matmul(bf_numer, Gk)
         return bf_numer, bf_denom
     
+
     #
     # 2. Reorient lead field in direction of max power or normal
-    # TODO: still to implement for nulling beamformer
+    #
+    if pick_ori == "max-power":
+        assert n_orient == 3
+        _, bf_denom = _compute_bf_terms(Gk, Cm_inv)
+        if weight_norm is None:
+            ori_numer = np.eye(n_orient)[np.newaxis]
+            ori_denom = bf_denom
+        else:
+            # compute power, cf Sekihara & Nagarajan 2008, eq. 4.47
+            ori_numer = bf_denom
+            # Cm_inv should be Hermitian so no need for .T.conj()
+            ori_denom = np.matmul(
+                np.matmul(Gk.swapaxes(-2, -1).conj(), Cm_inv @ Cm_inv), Gk
+            )
+        ori_denom_inv = _sym_inv_sm(ori_denom, reduce_rank, inversion, sk)
+        ori_pick = np.matmul(ori_denom_inv, ori_numer)
+        assert ori_pick.shape == (n_sources, n_orient, n_orient)
+
+        # pick eigenvector that corresponds to maximum eigenvalue:
+        eig_vals, eig_vecs = np.linalg.eig(ori_pick.real)  # not Hermitian!
+        # sort eigenvectors by eigenvalues for picking:
+        order = np.argsort(np.abs(eig_vals), axis=-1)
+        # eig_vals = np.take_along_axis(eig_vals, order, axis=-1)
+        max_power_ori = eig_vecs[np.arange(len(eig_vecs)), :, order[:, -1]]
+        assert max_power_ori.shape == (n_sources, n_orient)
+
+        # set the (otherwise arbitrary) sign to match the normal
+        signs = np.sign(np.sum(max_power_ori * nn, axis=1, keepdims=True))
+        signs[signs == 0] = 1.0
+        max_power_ori *= signs
+
+        # Compute the lead field for the optimal orientation,
+        # and adjust numer/denom
+        Gk = np.matmul(Gk, max_power_ori[..., np.newaxis])
+        n_orient = 1
+    else:
+        max_power_ori = None
+        if pick_ori == "normal":
+            Gk = Gk[..., 2:3]
+            n_orient = 1
     
     n_nulls = len(null_idxs)
     n_sources = Gk.shape[0]
@@ -642,6 +730,7 @@ def _compute_nulling_beamformer(
         var_explained = 100 * np.cumsum(explained_variance_ratio)
         print(f"Using {k_null} SVD components spanning {var_explained[k_null-1]:.1f}% variance")
         
+
     # compute error of svd reconstruction
     error = np.linalg.norm(G_null_flat - G_reconstructed, 'fro')
     relative_error = error / np.linalg.norm(G_null_flat, 'fro')
@@ -654,6 +743,11 @@ def _compute_nulling_beamformer(
     #    n_nulls = k_null
     #else:
     # Reshape back to original structure
+
+    import time
+    print("Starting weight computation...")
+    start_time = time.time()
+
     G_null_svd = G_null_svd.reshape(n_nulls, n_orient, n_channels)
     G_null_svd = G_null_svd.swapaxes(-2, -1)  # (n_nulls, n_orient, n_channels)
 
@@ -671,6 +765,8 @@ def _compute_nulling_beamformer(
         ],
         axis=1
     )
+    print("Prep G --- %s seconds ---" % (time.time() - start_time))
+
 
     #G_all = np.hstack([g_target, G_null]) # only for one source
     assert G_all.shape == (n_sources, n_nulls + 1, n_channels, n_orient)
@@ -678,14 +774,21 @@ def _compute_nulling_beamformer(
 
     # set up the constraint matrix
     f_single = np.array([1.0] + [0.0] * n_nulls)
-    f = np.kron(f_single, np.identity(n_orient)).reshape(n_orient, n_orient, 25)
+    f = np.kron(f_single, np.identity(n_orient)).reshape(n_orient, n_orient, n_nulls+1)
 
     # compute numerator and denominator of the Lagrange multiplier
     numerator = np.matmul(Cm_inv, G_all_flat)
+    print("Computed numerator --- %s seconds ---" % (time.time() - start_time))
+
     
     denominator = np.matmul(np.moveaxis(G_all_flat, -2, -1), (np.matmul(Cm_inv, G_all_flat)))
+    print("Computed denominator --- %s seconds ---" % (time.time() - start_time))
+    #denom_inv = _sym_inv_sm_nulling(denominator, n_nulls, reduce_rank, inversion, sk)
+    print("Computed denominator 1 --- %s seconds ---" % (time.time() - start_time))
     denom_inv = np.linalg.pinv(denominator)
+    print("Computed denominator 2 --- %s seconds ---" % (time.time() - start_time))
     denom_inv = np.moveaxis(denom_inv, 1, -1)
+    print("Computed denominator --- %s seconds ---" % (time.time() - start_time))
 
     # compute the constraints
     f_all = np.repeat(f[None], n_sources, axis=0)
@@ -693,152 +796,13 @@ def _compute_nulling_beamformer(
 
     # compute the weights
     denom_inv_f = np.matmul(denom_inv, f_all)
+    print("Computed constraints --- %s seconds ---" % (time.time() - start_time))
+
     W0 = np.matmul(numerator, denom_inv_f)
     W = np.moveaxis(W0, 1, -1)
 
-    # define the constraint matrix
-    #f = np.array([1.0] + [0.0] * n_nulls)
+    print("Weight computation took --- %s seconds ---" % (time.time() - start_time))
 
-    # define the numerator of the Lagrange function
-    bf_numer = np.matmul(G_all.swapaxes(-2, -1).conj(), Cm_inv)
-
-    # define the numerator of the Lagrange function
-    bf_numer_test = np.matmul(G.swapaxes(-2, -1).conj(), Cm_inv)
-    assert bf_numer_test.shape == (n_sources, n_orient, n_channels)
-
-    #W = np.zeros((n_sources, n_orient, n_channels))  # (n_sources, n_orient, n_chan)
-
-    """
-    for s in range(n_sources):
-
-        # only for LCMV comparison use the G without nulls
-        G_s_test = G[s]
-        numer_s_test = bf_numer_test[s]  
-        
-        # nulling: for each source add the nulling constraints
-        G_s = G_all[s]
-        numer_s = bf_numer[s]  
-        assert G_s.shape == (n_nulls + 1, n_channels, n_orient)
-        assert numer_s.shape == (n_nulls + 1, n_orient, n_channels)
-
-        # put orientation in the front
-        G_s_o  = np.moveaxis(G_s, 2, 0)   
-        G_s_o_test  = G_s_test.T
-        numer_s_o = np.moveaxis(numer_s, 1, 0)
-        assert G_s_o.shape == (n_orient, n_nulls + 1, n_channels)
-        assert numer_s_o.shape == (n_orient, n_nulls + 1, n_channels)
-
-        f = np.array([1.0] + [0.0] * n_nulls)
-
-        for o in range(n_orient):
-            G_single_test = G_s_o_test[o]
-            numer_single_test = numer_s_test[o]  
-            denom_test = G_single_test.T @ numer_single_test              # (K, K)
-            #denom_inv_test = np.linalg.pinv(denom_test)
-            
-            # for each orientation compute the denominator
-            G_single = G_s_o[o].T                   # (n_chan, K)
-            numer_single = numer_s_o[o].T                 # (n_chan, K) == C_reg @ A
-            assert G_single.shape == (n_channels, n_nulls + 1)
-            assert numer_single.shape == (n_channels, n_nulls + 1)
-            
-            # tmp = Aᵀ C A: (K, K)
-            denom = G_single.T @ numer_single                   # (K, K)
-            denom_inv = np.linalg.pinv(denom)    # (K, K)
-            assert denom_inv.shape == (n_nulls + 1, n_nulls + 1)
-
-            #w_test =  numer_single @ denom_inv 
-            # w = C A tmp_inv d = CA tmp_inv d
-            w = numer_single @ (denom_inv @ f)           # (n_chan, 1)
-            W[s, o, :] = w
-
-            # verify weights
-            gain_target = w.T @ G_s_o[o, 0, :].T
-            gain_nulls = w.T @ G_s_o[o, 1:, :].T
-            
-            if (gain_nulls > 1e-5).any():
-                print(f"Warning: high gain at nulling source for source {s}, orientation {o}: {gain_nulls}")
-
-            if gain_target < 0.99:
-                print('Gain at target source (should be 1): ', gain_target)
-            #print('Gain at nulling sources (should be 0): ', gain_nulls)
-
-            # check orthogonality of G_null and G
-            somato_ids = [np.int64(3200),
-                            np.int64(3293),
-                            np.int64(3295),
-                            np.int64(3379),
-                            np.int64(3380),
-                            np.int64(3385),
-                            np.int64(3387),
-                            np.int64(3392),
-                            np.int64(3478),
-                            np.int64(3484),
-                            np.int64(3577),
-                            np.int64(3580),
-                            np.int64(3583),
-                            np.int64(3670),
-                            np.int64(3675),
-                            np.int64(3683),
-                            np.int64(3685),
-                            np.int64(3781),
-                            np.int64(3783),
-                            np.int64(3879),
-                            np.int64(3884),
-                            np.int64(3968),
-                            np.int64(3970),
-                            np.int64(3981),
-                            np.int64(4058),
-                            np.int64(4061),
-                            np.int64(4131),
-                            np.int64(4135),
-                            np.int64(4137),
-                            np.int64(4143),
-                            np.int64(4225),
-                            np.int64(4226),
-                            np.int64(4317),
-                            np.int64(4393),
-                            np.int64(4396),
-                            np.int64(9508),
-                            np.int64(9862),
-                            np.int64(10012),
-                            np.int64(10019)]
-            vis_rh = [np.int64(265),
-                        np.int64(266),
-                        np.int64(270),
-                        np.int64(302),
-                        np.int64(303),
-                        np.int64(337),
-                        np.int64(377),
-                        np.int64(379),
-                        np.int64(380),
-                        np.int64(381),
-                        np.int64(417),
-                        np.int64(503),
-                        np.int64(505),
-                        np.int64(507),
-                        np.int64(555),
-                        np.int64(556),
-                        np.int64(598),
-                        np.int64(659),
-                        np.int64(663),
-                        np.int64(710),
-                        np.int64(8887),
-                        np.int64(8929),
-                        np.int64(10158),
-                        np.int64(10170)]
-            if s in somato_ids:
-                for i in range(n_nulls):
-                    overlap = np.abs(G[s, :, o] @ G_null_svd[i, :, o].conj())
-                    overlap_norm = overlap / (np.linalg.norm(G[s, :, o]) * np.linalg.norm(G_null_svd[i, :, o]))
-                    print(f"Null {i} overlap with SOMA target: {overlap_norm}")
-            if s in vis_rh:
-                for i in range(n_nulls):
-                    overlap = np.abs(G[s, :, o] @ G_null_svd[i, :, o].conj())
-                    overlap_norm = overlap / (np.linalg.norm(G[s, :, o]) * np.linalg.norm(G_null_svd[i, :, o]))
-                    print(f"Null {i} overlap with VIS target: {overlap_norm}")
-    """
-    
     ###################################################
     #
     # 5. Re-scale filter weights according to the selected weight_norm
@@ -907,8 +871,6 @@ def _compute_nulling_beamformer(
     #print('Gain at target source (should be 1): ', gain_target)
     #print('Gain at nulling sources (should be 0): ', gain_nulls)
 
-    #TODO: compute max power orientation (same as in _compute_beamformer)
-    max_power_ori = None
     
     W = W.reshape(n_sources * n_orient, n_channels)
     logger.info("Filter computation complete")
