@@ -26,6 +26,91 @@ from ..utils import (
     verbose,
     warn,
 )
+import scipy.sparse as sp
+from scipy.sparse.linalg import svds
+
+
+def _random_svd_inv(denominator, n_components=None, oversampling=10, 
+                   power_iterations=2, random_state=None):
+    """Compute pseudo-inverse using randomized SVD for large matrices.
+    
+    This function uses randomized SVD to efficiently compute the pseudo-inverse
+    of large matrices, which is particularly useful for nulling beamformer
+    where the denominator matrix can be very large.
+    
+    Parameters
+    ----------
+    denominator : ndarray, shape (n_sources, n_constraints, n_constraints)
+        The matrix to invert (denominator in beamformer formula).
+    n_components : int | None
+        Number of components to compute. If None, uses min(n_constraints) - 1.
+    oversampling : int
+        Oversampling parameter for randomized SVD (default: 10).
+    power_iterations : int
+        Number of power iterations for randomized SVD (default: 2).
+    random_state : int | None
+        Random state for reproducibility.
+        
+    Returns
+    -------
+    denom_inv : ndarray, shape (n_sources, n_constraints, n_constraints)
+        Pseudo-inverse of the denominator matrix computed using randomized SVD.
+    """
+    n_sources, n_constraints, _ = denominator.shape
+    
+    if n_components is None:
+        n_components = n_constraints - 1
+    
+    # Ensure n_components doesn't exceed matrix dimensions
+    n_components = min(n_components, n_constraints - 1, n_constraints)
+    
+    denom_inv = np.zeros_like(denominator)
+    
+    for s in range(n_sources):
+        # Get the matrix for this source
+        A = denominator[s]
+        
+        # Check if matrix is already small enough for standard SVD
+        if n_constraints <= 50:
+            # Use standard SVD for small matrices
+            U, s_vals, Vt = np.linalg.svd(A, full_matrices=False)
+        else:
+            # Use randomized SVD for large matrices
+            try:
+                # Convert to sparse if beneficial
+                if n_constraints > 100:
+                    A_sparse = sp.csr_matrix(A)
+                else:
+                    A_sparse = A
+                
+                # Compute randomized SVD
+                U, s_vals, Vt = svds(A_sparse, k=n_components, 
+                                   return_singular_vectors=True,
+                                   random_state=random_state)
+                
+                # svds returns smallest singular values, we need largest
+                # so we reverse the order
+                U = U[:, ::-1]
+                s_vals = s_vals[::-1]
+                Vt = Vt[::-1, :]
+                
+            except Exception as e:
+                # Fallback to standard SVD if randomized SVD fails
+                logger.warning(f"Randomized SVD failed for source {s}, "
+                             f"falling back to standard SVD: {e}")
+                U, s_vals, Vt = np.linalg.svd(A, full_matrices=False)
+        
+        # Compute pseudo-inverse using SVD
+        # A^+ = V * S^+ * U^T where S^+ has 1/s for non-zero singular values
+        s_inv = np.zeros_like(s_vals)
+        tol = max(1e-12, np.finfo(float).eps * max(A.shape) * s_vals[0])
+        non_zero = s_vals > tol
+        s_inv[non_zero] = 1.0 / s_vals[non_zero]
+        
+        # Reconstruct pseudo-inverse
+        denom_inv[s] = Vt.T @ np.diag(s_inv) @ U.T
+    
+    return denom_inv
 
 
 def _check_proj_match(proj, filters):
@@ -684,7 +769,16 @@ def _compute_nulling_beamformer(
     numerator = np.matmul(Cm_inv, G_all_flat)
     
     denominator = np.matmul(np.moveaxis(G_all_flat, -2, -1), (np.matmul(Cm_inv, G_all_flat)))
-    denom_inv = np.linalg.pinv(denominator)
+    
+    # Use random SVD for large matrices to make inversion more feasible
+    n_constraints = denominator.shape[1]
+    if n_constraints > 50:  # Use random SVD for matrices larger than 50x50
+        logger.info(f"Using random SVD for denominator inversion (size: {n_constraints}x{n_constraints})")
+        denom_inv = _random_svd_inv(denominator, n_components=None, random_state=42)
+    else:
+        # Use standard pseudo-inverse for smaller matrices
+        denom_inv = np.linalg.pinv(denominator)
+    
     denom_inv = np.moveaxis(denom_inv, 1, -1)
 
     # compute the constraints
