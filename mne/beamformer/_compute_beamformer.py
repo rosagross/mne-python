@@ -5,8 +5,7 @@
 # Copyright the MNE-Python contributors.
 
 from copy import deepcopy
-import seaborn as sns
-import matplotlib.pyplot as plt
+
 import numpy as np
 
 from .._fiff.proj import Projection, make_projector
@@ -341,7 +340,6 @@ def _reduce_leadfield_rank(G):
 
 def _sym_inv_sm(x, reduce_rank, inversion, sk):
     """Symmetric inversion with single- or matrix-style inversion."""
-    print('shape of x', x.shape)
     if x.shape[1:] == (1, 1):
         with np.errstate(divide="ignore", invalid="ignore"):
             x_inv = 1.0 / x
@@ -371,7 +369,6 @@ def _sym_inv_sm(x, reduce_rank, inversion, sk):
 
 def _sym_inv_sm_nulling(x, n_nulls, reduce_rank, inversion, sk):
     """Symmetric inversion with single- or matrix-style inversion."""
-    print('shape of x', x.shape)
     if x.shape[1:] == (1*(n_nulls+1), 1*(n_nulls+1)):
         with np.errstate(divide="ignore", invalid="ignore"):
             x_inv = 1.0 / x
@@ -864,128 +861,76 @@ def _compute_nulling_beamformer(
     
     n_nulls = len(null_idxs)
     n_sources = Gk.shape[0]
-
-    # for now I only deal with:
     G = Gk.reshape(n_sources, n_channels, n_orient)
 
+    if n_nulls == 0:
+        orient_std = sk
+        if orient_std.shape[1] != n_orient:
+            orient_std = np.ones((n_sources, n_orient))
+        logger.info(
+            "No nulling sources overlap with the source space, falling back to "
+            "standard beamformer computation"
+        )
+        return _compute_beamformer(
+            G=Gk.transpose(0, 2, 1).reshape(n_sources * n_orient, n_channels).T,
+            Cm=Cm,
+            reg=reg,
+            n_orient=n_orient,
+            weight_norm=weight_norm,
+            pick_ori=None,
+            reduce_rank=reduce_rank,
+            rank=rank,
+            inversion=inversion,
+            nn=nn,
+            orient_std=orient_std.reshape(-1),
+            whitener=np.eye(n_channels),
+        )
 
-    #################################################
-    # we now solve the optimization problem using Lagrange multipliers
-    # W = argmin_W  W^T Cm W
+    # Build a set of null constraints in sensor space.
+    G_null = G[null_idxs]
+    null_basis = np.moveaxis(G_null, -1, 1).reshape(n_nulls * n_orient, n_channels)
 
-    # get the G with the columns corresponding to the null indices
-    G_null = G[null_idxs, :, :]  # shape (n_nulls, n_channels, n_orient)
-    assert G_null.shape == (n_nulls, n_channels, n_orient)  # (n_nulls, n_channels, n_orient)
-    
-    #g_target = G[:, target_idx] # shape (n_channels, n_targets)
-    #assert g_target.shape == (n_channels, 1)  # (n_channels, n_orient, n_targets)
-    
-    # Flatten for SVD 
-    G_null_flat = G_null.reshape(n_nulls * n_orient, n_channels).T  # (n_channels, n_nulls * n_orient)
-
-    # SVD decomposition
-    U, s, Vt = np.linalg.svd(G_null_flat, full_matrices=False)  # (n_channels, n_channels)
-    # s are singular values, U are left singular vectors, Vt are right singular vectors
-    
-    # free memory
-    del G_null
-
-    # Determine number of components to use
-    if null_reduction == "none" or null_reduction is None:
-        # Use all components (no dimensionality reduction)
-        G_null_svd = G_null_flat.T  # (n_nulls * n_orient, n_channels)
-    else:    
-        if null_reduction == "auto" or (isinstance(null_reduction, float) and 0 < null_reduction < 1):
-            # Auto: use variance threshold (default 0.99)
-            variance_threshold = null_reduction if isinstance(null_reduction, float) else 0.99
-            explained_variance_ratio = s**2 / np.sum(s**2)
-            k_null = np.where(np.cumsum(explained_variance_ratio) > variance_threshold)[0][0] + 1
-            
-        elif isinstance(null_reduction, int):
-            # Fixed number of components
-            k_null = min(null_reduction, n_nulls * n_orient, n_channels)
-
+    if null_reduction not in (None, "none"):
+        U, s, _ = np.linalg.svd(null_basis.T, full_matrices=False)
+        explained = s**2
+        explained /= explained.sum()
+        if null_reduction == "auto":
+            k_null = np.searchsorted(np.cumsum(explained), 0.99) + 1
+        elif isinstance(null_reduction, float) and 0 < null_reduction < 1:
+            k_null = np.searchsorted(np.cumsum(explained), null_reduction) + 1
+        elif isinstance(null_reduction, int) and null_reduction > 0:
+            k_null = min(null_reduction, len(s))
         else:
-            raise ValueError(f"Invalid null_reduction: {null_reduction}. Use 'none', 'auto', float (0-1), or int.")
-
-        U_null = U[:, :k_null]  # (k_null, n_channels)
-        G_reconstructed = U_null @ np.diag(s[:k_null]) @ Vt[:k_null, :]
-        G_null_svd = G_reconstructed.T  # (n_nulls * n_orient, n_channels)
-        explained_variance_ratio = s**2 / np.sum(s**2)
-        var_explained = 100 * np.cumsum(explained_variance_ratio)
-        print(f"Using {k_null} SVD components spanning {var_explained[k_null-1]:.1f}% variance")
-        
-
-    # compute error of svd reconstruction
-    error = np.linalg.norm(G_null_flat - G_reconstructed, 'fro')
-    relative_error = error / np.linalg.norm(G_null_flat, 'fro')
-    print(f'Components: {k_null:2d}, Absolute error: {error:.6f}, Relative error: {relative_error:.6f}')
-    del G_null_flat, G_reconstructed, U, s, Vt
-
-
-    import time
-    print("Starting weight computation...")
-    start_time = time.time()
-
-    G_null_svd = G_null_svd.reshape(n_nulls, n_orient, n_channels)
-    G_null_svd = G_null_svd.swapaxes(-2, -1)  # (n_nulls, n_orient, n_channels)
-
-    # combine target and null lead fields
-    g_prep = G[:, None, :, :]
-    g_null_all = np.repeat(
-                G_null_svd[None, :, :, :],               # (1, n_channels, n_orient, n_nulls)
-                n_sources,
-                axis=0
+            raise ValueError(
+                f"Invalid null_reduction: {null_reduction}. Use 'none', "
+                "'auto', a float in (0, 1), or a positive int."
             )
-    G_all = np.concatenate(
-        [
-            g_prep,                 # (1,  n_nulls, n_channels, n_orient)
-            g_null_all                   # (n_sources, n_nulls, n_channels, n_orient)
-        ],
-        axis=1
+        null_basis = U[:, :k_null].T
+        logger.info(
+            "Using %d reduced null-space component%s explaining %.1f%% variance",
+            k_null,
+            _pl(k_null),
+            100 * np.cumsum(explained)[k_null - 1],
+        )
+
+    n_null_constraints = null_basis.shape[0]
+    null_basis = np.broadcast_to(
+        null_basis.T[np.newaxis], (n_sources, n_channels, n_null_constraints)
     )
-    print("Prep G --- %s seconds ---" % (time.time() - start_time))
+    G_all = np.concatenate([G, null_basis], axis=2)
+    denominator = np.matmul(np.moveaxis(G_all, -2, -1), np.matmul(Cm_inv, G_all))
+    numerator = np.matmul(Cm_inv, G_all)
 
-    assert G_all.shape == (n_sources, n_nulls + 1, n_channels, n_orient)
-    G_all_flat = np.moveaxis(G_all, 1, -2).reshape(n_sources, n_channels, n_orient*(n_nulls+1))
-    del G_all
+    denom_inv = np.empty_like(denominator)
+    for source_idx in range(n_sources):
+        denom_inv[source_idx] = np.linalg.pinv(denominator[source_idx])
 
-    # set up the constraint matrix
-    f_single = np.array([1.0] + [0.0] * n_nulls)
-    f = np.kron(f_single, np.identity(n_orient)).reshape(n_orient, n_orient, n_nulls+1)
-    print("Computed kroneker prod --- %s seconds ---" % (time.time() - start_time))
+    f = np.zeros((n_orient + n_null_constraints, n_orient))
+    f[:n_orient] = np.eye(n_orient)
+    f_all = np.broadcast_to(f, (n_sources,) + f.shape)
 
-    # compute numerator and denominator of the Lagrange multiplier
-    numerator = np.matmul(Cm_inv, G_all_flat)
-    print("Computed numerator --- %s seconds ---" % (time.time() - start_time))
-    denominator = np.matmul(np.moveaxis(G_all_flat, -2, -1), (np.matmul(Cm_inv, G_all_flat)))
-    print('shape denominator', denominator.shape)
-
-    # the nulling regions always have the same inversion
-    # but the target does not! 
-    d_inv = np.linalg.pinv(denominator[0, 1:, 1:])
-    block_invs = np.empty_like(denominator)
-    for s in range(n_sources):
-        block_invs[s] = block_inverse_schur(denominator[s], d_inv)
-
-    denom_invs = block_invs.copy()
-    denom_inv = np.moveaxis(denom_invs, 1, -1)
-    
-    del denominator
-    print("Computed denominator --- %s seconds ---" % (time.time() - start_time))
-
-    # compute the constraints
-    f_all = np.repeat(f[None], n_sources, axis=0)
-    f_all = np.moveaxis(f_all, -1, 1).reshape(n_sources, n_orient*(n_nulls+1), n_orient)
-
-    # compute the weights
-    denom_inv_f = np.matmul(denom_inv, f_all)
-    print("Computed constraints --- %s seconds ---" % (time.time() - start_time))
-
-    W0 = np.matmul(numerator, denom_inv_f)
+    W0 = np.matmul(numerator, np.matmul(denom_inv, f_all))
     W = np.moveaxis(W0, 1, -1)
-
-    print("Weight computation took --- %s seconds ---" % (time.time() - start_time))
 
     ###################################################
     #
