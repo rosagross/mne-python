@@ -5,7 +5,8 @@
 # Copyright the MNE-Python contributors.
 
 from copy import deepcopy
-
+import seaborn as sns
+import matplotlib.pyplot as plt
 import numpy as np
 
 from .._fiff.proj import Projection, make_projector
@@ -29,6 +30,106 @@ from ..utils import (
 import scipy.sparse as sp
 from scipy.sparse.linalg import svds
 
+def block_inverse_schur(M: np.ndarray, D_inv: np.ndarray) -> np.ndarray:
+    """
+    Pseudo-inverse of a bordered matrix M = [[a, b^T], [b, D]]
+    using a precomputed D_inv = pinv(D).
+
+    Schur complement approach (exact when D is full-rank):
+        S   = a - b^T @ D_inv @ b          (scalar)
+        M^+ ≈ assembled from S, D_inv, b
+    Falls back to np.linalg.pinv when S ≈ 0 (rank-deficient corner).
+    """
+    a   = M[0, 0]                   # scalar
+    b   = M[1:, 0]                  # (n-1,)
+    # D = M[1:, 1:]  — not needed, we already have D_inv
+
+    D_inv_b = D_inv @ b             # (n-1,)
+    S = a - b @ D_inv_b             # Schur complement (scalar)
+
+    if abs(S) < 1e-12:
+        # Degenerate: fall back to full pinv for this source
+        return np.linalg.pinv(M)
+
+    S_inv = 1.0 / S
+
+    # Blocks of the inverse
+    inv_00 = S_inv                                          # scalar
+    inv_0r = -S_inv * D_inv_b                              # (n-1,)
+    inv_r0 = inv_0r                                        # (n-1,)  symmetric
+    inv_rr = D_inv + S_inv * np.outer(D_inv_b, D_inv_b)   # (n-1, n-1)
+
+    # Assemble full inverse
+    n = M.shape[0]
+    inv_M = np.empty((n, n), dtype=np.float64)
+    inv_M[0,  0 ] = inv_00
+    inv_M[0,  1:] = inv_0r
+    inv_M[1:, 0 ] = inv_r0
+    inv_M[1:, 1:] = inv_rr
+    return inv_M
+
+
+def randomized_pinv(A, rank=None, power_iter=2, tol=1e-12):
+    """
+    Compute approximate pseudoinverse using randomized SVD.
+    
+    Parameters:
+    -----------
+    A : array (m, n)
+        Input matrix
+    rank : int, optional
+        Target rank for approximation. If None, auto-selects based on singular values.
+    power_iter : int
+        Number of power iterations for better subspace capture
+    tol : float
+        Singular value cutoff for pseudoinverse
+    
+    Returns:
+    --------
+    A_pinv : array (n, m)
+        Approximate pseudoinverse
+    """
+    m, n = A.shape
+    
+    # Step 1: Random projection to capture dominant range
+    if rank is None:
+        rank = min(100, min(m, n) // 2)  # Conservative default for 100x100
+    
+    # Gaussian random matrix
+    omega = np.random.randn(n, rank)
+    
+    # Power iteration for better accuracy (Steve Brunton recommendation)
+    for i in range(power_iter):
+        omega = A.T @ A @ omega
+    
+    # QR for orthonormal basis of dominant range
+    Y = A @ omega
+    Q, _ = np.linalg.qr(Y)
+    
+    # Step 2: Project to low-dimensional space
+    B = Q.T @ A  # (rank, n)
+    
+    # Step 3: Exact SVD on small matrix
+    U_hat, s, Vh = np.linalg.svd(B, full_matrices=False)
+    
+    # Auto-truncation: keep singular values above tolerance
+    if rank is None:
+        rank_trunc = np.sum(s > tol * s[0])
+        U_hat = U_hat[:, :rank_trunc]
+        s = s[:rank_trunc]
+        Vh = Vh[:rank_trunc]
+    
+    # Step 4: Reconstruct full SVD approximation
+    U = Q @ U_hat  # (m, rank_trunc)
+    
+    # Step 5: Pseudoinverse from SVD: V @ Sigma^+ @ U.T
+    s_inv = np.zeros_like(s)
+    s_inv[s > tol] = 1.0 / s[s > tol]  # Avoid division by zero
+    
+    Sigma_inv = np.diag(s_inv)
+    A_pinv = Vh.T @ Sigma_inv @ U.T  # (n, m)
+    
+    return A_pinv
 
 def _random_svd_inv(denominator, n_components=None, oversampling=10, 
                    power_iterations=2, random_state=None):
@@ -786,6 +887,9 @@ def _compute_nulling_beamformer(
     U, s, Vt = np.linalg.svd(G_null_flat, full_matrices=False)  # (n_channels, n_channels)
     # s are singular values, U are left singular vectors, Vt are right singular vectors
     
+    # free memory
+    del G_null
+
     # Determine number of components to use
     if null_reduction == "none" or null_reduction is None:
         # Use all components (no dimensionality reduction)
@@ -820,6 +924,7 @@ def _compute_nulling_beamformer(
     error = np.linalg.norm(G_null_flat - G_reconstructed, 'fro')
     relative_error = error / np.linalg.norm(G_null_flat, 'fro')
     print(f'Components: {k_null:2d}, Absolute error: {error:.6f}, Relative error: {relative_error:.6f}')
+    del G_null_flat, G_reconstructed, U, s, Vt
 
     # Broadcast to orientations 
     #if null_reduction != "none" and null_reduction is not None:
@@ -852,32 +957,52 @@ def _compute_nulling_beamformer(
     )
     print("Prep G --- %s seconds ---" % (time.time() - start_time))
 
-
-    #G_all = np.hstack([g_target, G_null]) # only for one source
     assert G_all.shape == (n_sources, n_nulls + 1, n_channels, n_orient)
     G_all_flat = np.moveaxis(G_all, 1, -2).reshape(n_sources, n_channels, n_orient*(n_nulls+1))
+    del G_all
 
     # set up the constraint matrix
     f_single = np.array([1.0] + [0.0] * n_nulls)
     f = np.kron(f_single, np.identity(n_orient)).reshape(n_orient, n_orient, n_nulls+1)
+    print("Computed kroneker prod --- %s seconds ---" % (time.time() - start_time))
 
     # compute numerator and denominator of the Lagrange multiplier
     numerator = np.matmul(Cm_inv, G_all_flat)
     print("Computed numerator --- %s seconds ---" % (time.time() - start_time))
-
-    
     denominator = np.matmul(np.moveaxis(G_all_flat, -2, -1), (np.matmul(Cm_inv, G_all_flat)))
-    
-    # Use random SVD for large matrices to make inversion more feasible
-    n_constraints = denominator.shape[1]
-    if n_constraints > 50:  # Use random SVD for matrices larger than 50x50
-        logger.info(f"Using random SVD for denominator inversion (size: {n_constraints}x{n_constraints})")
-        denom_inv = _random_svd_inv(denominator, n_components=None, random_state=42)
+    print('shape denominator', denominator.shape)
+    rSVD = False
+    """
+    if rSVD:
+        # Use random SVD for large matrices to make inversion more feasible
+        n_constraints = denominator.shape[1]
+        if n_constraints > 50:  # Use random SVD for matrices larger than 50x50
+            logger.info(f"Using random SVD for denominator inversion (size: {n_constraints}x{n_constraints})")
+            denom_inv = _random_svd_inv(denominator, n_components=None, random_state=42)
+        else:
+            # Use standard pseudo-inverse for smaller matrices
+            denom_inv = np.linalg.pinv(denominator)
+        
+        denom_inv = np.moveaxis(denom_inv, 1, -1)
     else:
-        # Use standard pseudo-inverse for smaller matrices
+        start_time_denom = time.time()
         denom_inv = np.linalg.pinv(denominator)
+        print("time spent on denom inverse --- %s seconds ---" % (time.time() - start_time_denom))
+        denom_inv = np.moveaxis(denom_inv, 1, -1)
+    """
     
-    denom_inv = np.moveaxis(denom_inv, 1, -1)
+    
+    # the nulling regions always have the same inversion
+    # but the target does not! 
+    D_inv = np.linalg.pinv(denominator[0, 1:, 1:])
+    block_invs = np.empty_like(denominator)
+    for s in range(n_sources):
+        block_invs[s] = block_inverse_schur(denominator[s], D_inv)
+
+    denom_invs = block_invs.copy()
+    denom_inv = np.moveaxis(denom_invs, 1, -1)
+    
+    del denominator
     print("Computed denominator --- %s seconds ---" % (time.time() - start_time))
 
     # compute the constraints
