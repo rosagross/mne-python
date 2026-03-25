@@ -893,27 +893,23 @@ def _compute_nulling_beamformer(
     # Determine number of components to use
     if null_reduction == "none" or null_reduction is None:
         # Use all components (no dimensionality reduction)
-        k_null = min(n_channels, n_nulls * n_orient)
-       
-    elif null_reduction == "auto" or (isinstance(null_reduction, float) and 0 < null_reduction < 1):
-        # Auto: use variance threshold (default 0.99)
-        variance_threshold = null_reduction if isinstance(null_reduction, float) else 0.99
-        explained_variance_ratio = s**2 / np.sum(s**2)
-        k_null = np.where(np.cumsum(explained_variance_ratio) > variance_threshold)[0][0] + 1
-        
-    elif isinstance(null_reduction, int):
-        # Fixed number of components
-        k_null = min(null_reduction, n_nulls * n_orient, n_channels)
-
-    else:
-        raise ValueError(f"Invalid null_reduction: {null_reduction}. Use 'none', 'auto', float (0-1), or int.")
-
-    U_null = U[:, :k_null]  # (k_null, n_channels)
-    G_reconstructed = U_null @ np.diag(s[:k_null]) @ Vt[:k_null, :]
-    
-    if null_reduction is None:
         G_null_svd = G_null_flat.T  # (n_nulls * n_orient, n_channels)
-    else:
+    else:    
+        if null_reduction == "auto" or (isinstance(null_reduction, float) and 0 < null_reduction < 1):
+            # Auto: use variance threshold (default 0.99)
+            variance_threshold = null_reduction if isinstance(null_reduction, float) else 0.99
+            explained_variance_ratio = s**2 / np.sum(s**2)
+            k_null = np.where(np.cumsum(explained_variance_ratio) > variance_threshold)[0][0] + 1
+            
+        elif isinstance(null_reduction, int):
+            # Fixed number of components
+            k_null = min(null_reduction, n_nulls * n_orient, n_channels)
+
+        else:
+            raise ValueError(f"Invalid null_reduction: {null_reduction}. Use 'none', 'auto', float (0-1), or int.")
+
+        U_null = U[:, :k_null]  # (k_null, n_channels)
+        G_reconstructed = U_null @ np.diag(s[:k_null]) @ Vt[:k_null, :]
         G_null_svd = G_reconstructed.T  # (n_nulls * n_orient, n_channels)
         explained_variance_ratio = s**2 / np.sum(s**2)
         var_explained = 100 * np.cumsum(explained_variance_ratio)
@@ -926,13 +922,6 @@ def _compute_nulling_beamformer(
     print(f'Components: {k_null:2d}, Absolute error: {error:.6f}, Relative error: {relative_error:.6f}')
     del G_null_flat, G_reconstructed, U, s, Vt
 
-    # Broadcast to orientations 
-    #if null_reduction != "none" and null_reduction is not None:
-    #    G_null_svd = G_null_svd[:, None, :].repeat(n_orient, axis=1)  # (k_null, n_orient, n_channels)
-    #    G_null_svd = G_null_svd.swapaxes(-2, -1)  # (k_null, n_channels, n_orient)
-    #    n_nulls = k_null
-    #else:
-    # Reshape back to original structure
 
     import time
     print("Starting weight computation...")
@@ -971,33 +960,13 @@ def _compute_nulling_beamformer(
     print("Computed numerator --- %s seconds ---" % (time.time() - start_time))
     denominator = np.matmul(np.moveaxis(G_all_flat, -2, -1), (np.matmul(Cm_inv, G_all_flat)))
     print('shape denominator', denominator.shape)
-    rSVD = False
-    """
-    if rSVD:
-        # Use random SVD for large matrices to make inversion more feasible
-        n_constraints = denominator.shape[1]
-        if n_constraints > 50:  # Use random SVD for matrices larger than 50x50
-            logger.info(f"Using random SVD for denominator inversion (size: {n_constraints}x{n_constraints})")
-            denom_inv = _random_svd_inv(denominator, n_components=None, random_state=42)
-        else:
-            # Use standard pseudo-inverse for smaller matrices
-            denom_inv = np.linalg.pinv(denominator)
-        
-        denom_inv = np.moveaxis(denom_inv, 1, -1)
-    else:
-        start_time_denom = time.time()
-        denom_inv = np.linalg.pinv(denominator)
-        print("time spent on denom inverse --- %s seconds ---" % (time.time() - start_time_denom))
-        denom_inv = np.moveaxis(denom_inv, 1, -1)
-    """
-    
-    
+
     # the nulling regions always have the same inversion
     # but the target does not! 
-    D_inv = np.linalg.pinv(denominator[0, 1:, 1:])
+    d_inv = np.linalg.pinv(denominator[0, 1:, 1:])
     block_invs = np.empty_like(denominator)
     for s in range(n_sources):
-        block_invs[s] = block_inverse_schur(denominator[s], D_inv)
+        block_invs[s] = block_inverse_schur(denominator[s], d_inv)
 
     denom_invs = block_invs.copy()
     denom_inv = np.moveaxis(denom_invs, 1, -1)
@@ -1079,14 +1048,6 @@ def _compute_nulling_beamformer(
                 noise = max(noise, loading_factor)
             W /= np.sqrt(noise)
 
-
-    # Verify constraints
-    #gain_target = np.sum(W * G.T, axis=1)
-    #gain_nulls = W @ G_null
-    #print('Gain at target source (should be 1): ', gain_target)
-    #print('Gain at nulling sources (should be 0): ', gain_nulls)
-
-    
     W = W.reshape(n_sources * n_orient, n_channels)
     logger.info("Filter computation complete")
 
